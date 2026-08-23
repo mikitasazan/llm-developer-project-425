@@ -1,0 +1,9 @@
+[project]
+name = "helpdesk-agent"
+version = "0.1.0"
+description = "A small serverless support agent with an OpenAI-compatible model adapter"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
