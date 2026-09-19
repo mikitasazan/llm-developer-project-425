@@ -1,0 +1,83 @@
+# Ежедневная эскалация открытых тикетов Help Desk (шаг 6 проекта).
+#
+# Формат YaWL 0.1 (Yandex Workflows). Деплой:
+#   yc serverless workflow create --yaml-spec src/workflow.yaml
+#   yc serverless workflow update --name daily-escalation --yaml-spec src/workflow.yaml
+#
+# Поток (pull-режим по расписанию):
+#   Timer (cron 09:00)
+#     -> databaseQuery  : открытые тикеты старше 24 часов (YQL SELECT)
+#     -> switch         : просроченных нет -> терминальный шаг
+#     -> aiStudioAgent  : дайджест по выборке для оператора
+#     -> databaseQuery  : пометить выбранные тикеты как escalated (YQL UPDATE)
+#     -> httpCall       : отправить дайджест оператору (CF email-sender)
+#
+# Шаги с внешними вызовами несут retryPolicy на 5xx/timeout:
+# разовая ошибка YDB или AI Studio не роняет workflow.
+# Шаблоны - jq-интерполяция '\(...)', не ${...}.
+
+version: '0.1'
+
+main:
+  steps:
+    - name: fetchStaleTickets
+      type: databaseQuery
+      query: |
+        SELECT id, user_id, category, text, created_at
+        FROM tickets
+        WHERE status = 'open'
+          AND created_at < CurrentUtcTimestamp() - DateTime::MakeInterval(Day, 1);
+      retryPolicy:
+        onCodes: [RETRYABLE_ERROR, TIMEOUT]
+        maxAttempts: 3
+      next: hasStaleTickets
+
+    - name: hasStaleTickets
+      type: switch
+      condition: '\(.result | length > 0)'
+      cases:
+        - condition: true
+          next: buildDigest
+      default: finish
+
+    - name: buildDigest
+      type: aiStudioAgent
+      input:
+        instruction: |
+          Собери дайджест просроченных обращений для оператора поддержки:
+          id, категория, пользователь, краткое описание, возраст обращения.
+          Персональные данные из текстов обращений уже маскированы на границе
+          записи - не раскрывай их заново и не запрашивай.
+        tickets: '\(.result)'
+      retryPolicy:
+        onCodes: [RETRYABLE_ERROR, TIMEOUT, RATE_LIMITED]
+        maxAttempts: 3
+      next: markEscalated
+
+    - name: markEscalated
+      type: databaseQuery
+      query: |
+        UPDATE tickets
+        SET status = 'escalated', updated_at = CurrentUtcTimestamp()
+        WHERE id IN ('\(.input.tickets | map(.id) | join("','"))');
+      retryPolicy:
+        onCodes: [RETRYABLE_ERROR, TIMEOUT]
+        maxAttempts: 3
+      next: notifyOperator
+
+    - name: notifyOperator
+      type: httpCall
+      url: '\(env.EMAIL_SENDER_URL)'
+      method: POST
+      headers:
+        Content-Type: application/json
+      body:
+        operator_email: '\(env.OPERATOR_EMAIL)'
+        digest: '\(.result)'
+      retryPolicy:
+        onCodes: [RETRYABLE_ERROR, TIMEOUT]
+        maxAttempts: 3
+      next: finish
+
+    - name: finish
+      type: success
